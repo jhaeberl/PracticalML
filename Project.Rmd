@@ -1,0 +1,205 @@
+---
+title: "Practical Machine Learning - Final Project"
+author: "Jean-Pierre Haeberly"
+date: "February 24, 2016"
+output: html_document
+---
+
+<!--
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+``` 
+-->
+
+## Synopsis
+
+### Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. Six participants were asked to perform barbell lifts correctly and incorrectly in 5 different ways: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E). More information is available from the website here: <http://groupware.les.inf.puc-rio.br/har> (see the section on the Weight Lifting Exercise Dataset).
+
+### Goal
+
+Use data from the accelerometers on the belt, forearm, arm, and dumbell of 6 participants in weight lifting exercises to predict the manner in which the six participants did the exercise.
+
+### Data
+
+The training data for this project are available at <https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv>, and the test data are available at <https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv>.
+
+## Load the various packages we will use
+```{r, warning=FALSE, message=FALSE}
+library(caret)
+library(rpart)
+library(randomForest)
+library(gbm)
+library(doParallel)
+```
+
+## Load the data
+
+We assume that the csv files are located in the working directory. Note that the first column of the csv files holds the row numbers and we specify `row.names = 1` so that `read.csv()` does not create a variable for this column.
+```{r}
+pmltrain <- read.csv("pml-training.csv", row.names = 1, na.strings = c("NA","#DIV/0!",""),
+                    stringsAsFactors = FALSE)
+pmlquiz <- read.csv("pml-testing.csv", row.names = 1, na.strings = c("NA","#DIV/0!",""),
+                   stringsAsFactors = FALSE)
+```
+
+The variable we are to predict is labeled `classe` in the `pmltrain` data set. It has the values `A`, `B`, `C`, `D`, and `E`. This variable is missing from the `pmlquiz` data set which contains 20 records for which we are tasked to correctly predict the value of `classe`.
+
+The `pmltrain` dataset consists of `19622` instances and `159` variables including `classe`:
+```{r}
+dim(pmltrain)
+```
+
+## Clean the data
+
+Identify the columns of the training set that do not contain any data and remove them from both `pmltrain` and `pmlquiz`.
+```{r}
+cols2remove <- which(sapply(pmltrain, function(x) all(is.na(x))))
+length(cols2remove)
+pmltrain <- pmltrain[,-cols2remove]
+pmlquiz <- pmlquiz[,-cols2remove]
+```
+
+However, there are many more variables in `pmltrain` that have `19216` or more entries out of the `19622` equal to `NA`. Furthermore, these variables are precisely those that do not have any data in `pmlquiz`! Since the goal is to predict the value of `classe` for `pmlquiz` we can safely remove as they cannot possibly have any predictive value for the quiz set.
+```{r}
+cols2remove <- which(sapply(pmlquiz, function(x) all(is.na(x))))
+pmltrain <- pmltrain[, -cols2remove]
+pmlquiz <- pmlquiz[, -cols2remove]
+```
+
+we are down to `59` variables including `classe` and there are no more missing data in the new data frames so there is no need to do any imputation.
+```{r}
+dim(pmltrain)
+sum(complete.cases(pmltrain)) == dim(pmltrain)[1]
+```
+
+The variable `new_window` takes on two values, `Yes` and `No` in `pmltrain` but only the value `No` in `pmlquiz` so we can safely remove it. We also remove the `cvtd_timestamp` variable. It is of little value since we have the raw timestamps available.
+```{r}
+pmltrain <- pmltrain[, -which(names(pmltrain) %in% c("new_window","cvtd_timestamp"))]
+pmlquiz <- pmlquiz[, -which(names(pmlquiz) %in% c("new_window","cvtd_timestamp"))]
+```
+
+We are left with 57 variables including `classe`:
+```{r}
+dim(pmltrain)[2]
+```
+
+## Preprocess the data
+
+We examine the variables of type `numeric` and observe that none of them have near zero variance:
+```{r}
+numVars <- sapply(pmltrain, is.numeric)
+length(nearZeroVar(pmltrain[, numVars]))
+```
+
+We now center and scale these variables:
+```{r}
+procValues <- preProcess(pmltrain[,numVars], method=c("center", "scale"))
+train.scaled <- predict(procValues, pmltrain[,numVars])
+quiz.scaled <- predict(procValues, pmlquiz[,numVars])
+pmltrain[, numVars] <- train.scaled
+pmlquiz[, numVars] <- quiz.scaled
+```
+
+Finally we coerce the `classe` variable to a factor as well as the only other variable of class `character`, namely `user_name`:
+```{r}
+pmltrain$classe <- factor(pmltrain$classe)
+pmltrain$user_name <- factor(pmltrain$user_name)
+pmlquiz$user_name <- factor(pmlquiz$user_name)
+```
+
+We now partition `pmltrain` into a training and a testing set with `75%` of the data assigned to the training set.
+```{r}
+set.seed(1000)
+inTrainingSet <- createDataPartition(pmltrain$classe, p=.75, list=FALSE)
+training <- pmltrain[inTrainingSet,]
+testing <- pmltrain[-inTrainingSet,]
+```
+
+## First model - Decision Tree
+
+As mentioned in the discussion forum this model performs poorly. Let's find out how poorly.
+```{r}
+set.seed(1000)
+dtModFit <- rpart(classe ~ ., data = training, method = "class")
+```
+
+We do not bother to print the tree as the result is unreadable. We now predict `classe` for the test set and print the output of the `confusionMatrix()` function.
+```{r}
+predDTMod <- predict(dtModFit, testing, type = "class")
+confusionMatrix(predDTMod, testing$classe)
+```
+
+Indeed, the performance is quite poor with `84%` accuracy and low sensitivity values across all five classes.
+
+## Second model - Random Forest
+
+We set up a model using `randomForest()` with all default parameter values, namely the number of trees is 500, and the number of variables tried at each split, `mtry`, is 7, the (floor value of the) square root of 56, the number of variables.
+```{r rfmod, cache=TRUE, cache.vars=c("rfModFit")}
+set.seed(1000)
+rfModFit <- randomForest(classe ~ ., data = training, importance = TRUE)
+```
+
+Again We predict `classe` for the test set and print the output of the `confusionMatrix()` function.
+```{r}
+predRFMod <- predict(rfModFit, newdata = testing)
+confusionMatrix(predRFMod, testing$classe)
+```
+
+The performance is very good with almost `100%` out of sample accuracy and excellent sensitivity and specificity values across all five classes. In fact, if we predict the values for `classe` on the quiz set and submit online we get 20 out of 20 correct answers.
+```{r}
+predRFModQuiz = predict(rfModFit, newdata = pmlquiz)
+data.frame(ProblemID = pmlquiz$problem_id, classe = predRFModQuiz)
+```
+
+We plot the model to confirm the performance visually. We see that 500 tress is overkill, 200 would have done equally well.
+```{r}
+plot(rfModFit)
+```
+
+## Third model -- Boosted Trees
+
+We use the power of `caret` to fit a model using the `gbm` method and tune the model using a grid of parameter values and repeated cross-validation.
+
+```{r}
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 1)
+grid = expand.grid(interaction.depth = seq(1, 7, by = 2),
+                   n.trees = seq(250, 1000, by = 50),
+                   shrinkage = c(0.01, 0.1),
+                   n.minobsinnode = 10)
+```
+
+This computation is time consuming so we use the `doParallel` package to set up a cluster of four cores. By default, `caret` will take advantage of the cluster whenever possible.
+```{r gbmmod, cache=TRUE, cache.vars=c("gbmTune")}
+cl = makeCluster(4)
+registerDoParallel(cl)
+set.seed(1000)
+ptm = proc.time()
+gbmTune <- train(classe ~ ., data = training,
+                 method = "gbm",
+                 tuneGrid = grid,
+                 trControl = ctrl,
+                 verbose = FALSE)
+proc.time() - ptm
+stopCluster(cl)
+```
+
+We plot the results of the tuning process:
+```{r}
+ggplot(gbmTune) + theme(legend.position = "top")
+```
+
+We observe that a larger tree depth improves accuracy although the benefit fades away as the shrinkage value increases. Similarly, a larger number of trees improves accuracy but the effect disappears almost completely when the shrinkage value is `0.1` and the maximum tree depth is greater than 1. 
+
+Again We predict `classe` for the test set and print the output of the `confusionMatrix()` function.
+```{r}
+predgbmMod <- predict(gbmTune, newdata = testing)
+confusionMatrix(predgbmMod, testing$classe)
+```
+
+The performance is excellent, slightly better even than that of the random forest model although the improvement is not significant in any way. We again predict the values for `classe` on the quiz set and find that, not surprisingly, we get exactly the same predictions than those produced with the random forest model.
+```{r}
+predgbmModQuiz = predict(gbmTune, newdata = pmlquiz)
+data.frame(ProblemID = pmlquiz$problem_id, classe = predgbmModQuiz)
+```
